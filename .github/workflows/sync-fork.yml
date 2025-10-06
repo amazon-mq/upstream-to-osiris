@@ -1,0 +1,32 @@
+name: Sync Fork
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Sync all branches from upstream
+        run: |
+          git remote add upstream https://github.com/rabbitmq/osiris.git
+          git fetch upstream
+          git fetch origin
+
+          # Get all local branches
+          for branch in $(git branch -r | grep 'origin/' | grep -v 'HEAD' | sed 's/origin\///'); do
+            # Check if branch exists in upstream
+            if git ls-remote --heads upstream | grep -q "refs/heads/$branch"; then
+              echo "Syncing branch: $branch"
+              git checkout $branch
+              git merge upstream/$branch --no-edit
+              git push origin $branch
+            else
+              echo "Branch $branch does not exist in upstream, skipping"
+            fi
+          done
