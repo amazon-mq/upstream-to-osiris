@@ -28,6 +28,7 @@
          send_file/3,
          init_data_reader/2,
          init_offset_reader/2,
+         open_next_segment/1,
          resolve_offset_spec/2,
          read_header/1,
          chunk_iterator/1,
@@ -492,7 +493,8 @@
               range/0,
               config/0,
               counter_spec/0,
-              transport/0]).
+              transport/0,
+              header_map/0]).
 
 -spec directory(osiris:config() | list()) -> file:filename_all().
 directory(#{name := Name, dir := Dir}) ->
@@ -1483,6 +1485,13 @@ read_header(#?MODULE{cfg = #cfg{}} = State0) ->
                                             position = NextPos}}};
         {end_of_stream, _} = EOF ->
             EOF;
+        {offset_not_found, State1} ->
+            case open_next_segment(State1) of
+                {ok, State} ->
+                    read_header(State);
+                not_found ->
+                    {end_of_stream, State1}
+            end;
         {error, _} = Err ->
             Err
     end.
@@ -1514,6 +1523,7 @@ read_header(#?MODULE{cfg = #cfg{}} = State0) ->
 -spec chunk_iterator(state()) ->
     {ok, header_map(), chunk_iterator(), state()} |
     {end_of_stream, state()} |
+    {offset_not_found, state()} |
     {error, {invalid_chunk_header, term()}}.
 chunk_iterator(State) ->
     chunk_iterator(State, 1).
@@ -1521,6 +1531,7 @@ chunk_iterator(State) ->
 -spec chunk_iterator(state(), pos_integer() | all) ->
     {ok, header_map(), chunk_iterator(), state()} |
     {end_of_stream, state()} |
+    {offset_not_found, state()} |
     {error, {invalid_chunk_header, term()}}.
 chunk_iterator(State, Credit) ->
     chunk_iterator(State, Credit, undefined).
@@ -1530,6 +1541,7 @@ chunk_iterator(State, Credit) ->
                      chunk_iterator() | undefined) ->
     {ok, header_map(), chunk_iterator(), state()} |
     {end_of_stream, state()} |
+    {offset_not_found, state()} |
     {error, {invalid_chunk_header, term()}}.
 chunk_iterator(#?MODULE{cfg = #cfg{},
                         mode = #read{type = RType,
@@ -1714,6 +1726,9 @@ read_chunk_parsed(#?MODULE{mode = #read{}} = State0,
     case chunk_iterator(State0, all) of
         {end_of_stream, _} = Eos ->
             Eos;
+        {offset_not_found, State1} ->
+            {ok, State} = open_next_segment(State1),
+            read_chunk_parsed(State, HeaderOrNot);
         {ok, _H, I0, State1} when HeaderOrNot == no_header ->
             Records = iter_all_records(iterator_next(I0), []),
             {Records, State1};
@@ -1778,6 +1793,7 @@ is_valid_chunk_on_disk(SegFile, Pos) ->
 -spec send_file(gen_tcp:socket(), state()) ->
                    {ok, state()} |
                    {error, term()} |
+                   {offset_not_found, state()} |
                    {end_of_stream, state()}.
 send_file(Sock, State) ->
     send_file(Sock, State, fun(_, _) -> <<>> end).
@@ -1786,6 +1802,7 @@ send_file(Sock, State) ->
                 fun((header_map(), non_neg_integer()) -> binary())) ->
     {ok, state()} |
     {error, term()} |
+    {offset_not_found, state()} |
     {end_of_stream, state()}.
 send_file(Sock,
           #?MODULE{mode = #read{type = RType,
@@ -3026,8 +3043,32 @@ recover_tracking(Fd, Trk0, Pos0) ->
             Trk0
     end.
 
+-spec open_next_segment(state()) -> {ok, state()} | not_found.
+open_next_segment(#?MODULE{cfg = #cfg{shared = Shared,
+                                      directory = Dir},
+                           mode = #read{read_ahead = Ra0,
+                                        next_offset = NextChId0} = Read0,
+                           fd = Fd} = State0) ->
+    FirstChId = osiris_log_shared:first_chunk_id(Shared),
+    NextChId = max(FirstChId, NextChId0),
+    SegFile = make_file_name(NextChId, "segment"),
+    case file:open(filename:join(Dir, SegFile), [raw, binary, read]) of
+        {ok, Fd2} ->
+            ok = file:close(Fd),
+            Read = Read0#read{next_offset = NextChId,
+                              read_ahead = ra_clear(Ra0),
+                              position = ?LOG_HEADER_SIZE},
+            State = State0#?MODULE{current_file = SegFile,
+                                   fd = Fd2,
+                                   mode = Read},
+            {ok, State};
+        {error, enoent} ->
+            not_found
+    end.
+
 -spec read_header0(state()) ->
     {ok, map(), state()} |
+    {offset_not_found, state()} |
     {end_of_stream, state()}.
 read_header0(State) ->
     %% reads the next header if permitted
@@ -3038,12 +3079,10 @@ read_header0(State) ->
             {end_of_stream, State}
     end.
 
-read_header_with_ra(#?MODULE{cfg = #cfg{directory = Dir,
-                                        shared = Shared},
+read_header_with_ra(#?MODULE{cfg = #cfg{shared = Shared},
                              mode = #read{next_offset = NextChId0,
                                           position = Pos,
                                           read_ahead = Ra0} = Read0,
-                             current_file = CurFile,
                              fd = Fd} = State) ->
     case ra_read(Pos, ?HEADER_SIZE_B, Ra0) of
         Bin when is_binary(Bin) andalso
@@ -3055,32 +3094,11 @@ read_header_with_ra(#?MODULE{cfg = #cfg{directory = Dir,
                     ?FUNCTION_NAME(State#?MODULE{mode =
                                                  Read0#read{read_ahead = Ra}});
                 eof ->
-                    FirstOffset = osiris_log_shared:first_chunk_id(Shared),
-                    %% open next segment file and start there if it exists
-                    NextChId = max(FirstOffset, NextChId0),
-                    %% TODO: replace this check with a last chunk id counter
-                    %% updated by the writer and replicas
-                    SegFile = make_file_name(NextChId, "segment"),
-                    case SegFile == CurFile of
+                    case NextChId0 > osiris_log_shared:last_chunk_id(Shared) of
                         true ->
-                            %% the new filename is the same as the old one
-                            %% this should only really happen for an empty
-                            %% log but would cause an infinite loop if it does
                             {end_of_stream, State};
                         false ->
-                            case file:open(filename:join(Dir, SegFile),
-                                           [raw, binary, read]) of
-                                {ok, Fd2} ->
-                                    ok = file:close(Fd),
-                                    Read = Read0#read{next_offset = NextChId,
-                                                      read_ahead = ra_clear(Ra0),
-                                                      position = ?LOG_HEADER_SIZE},
-                                    read_header0(State#?MODULE{current_file = SegFile,
-                                                               fd = Fd2,
-                                                               mode = Read});
-                                {error, enoent} ->
-                                    {end_of_stream, State}
-                            end
+                            {offset_not_found, State}
                     end
             end
     end.
