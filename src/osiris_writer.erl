@@ -129,8 +129,18 @@ delete(#{leader_node := Node} = Config) ->
 start_link(Config) ->
     Mod = ?MODULE,
     Opts = [{reversed_batch, true},
-            {flush_mailbox_on_terminate, {true, 10}}],
+            {flush_mailbox_on_terminate, {true, 10}},
+            {batch_size_growth, batch_size_growth()}],
     gen_batch_server:start_link(undefined, Mod, Config, Opts).
+
+%% The whole growth strategy is read from application env, so an operator
+%% can switch between `exponential', `{aimd, Step}' and
+%% `{demand_following, Alpha, Headroom}' without a code change.
+%% gen_batch_server resolves this once at init, so a stream restart is
+%% required to pick up a change. Defaults to `exponential', the strategy
+%% in use before the EWMA-based demand-following work.
+batch_size_growth() ->
+    application:get_env(osiris, writer_batch_size_growth, exponential).
 
 overview(Pid) when node(Pid) == node() ->
     case erlang:is_process_alive(Pid) of
