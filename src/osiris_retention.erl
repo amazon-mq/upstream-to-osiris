@@ -64,13 +64,15 @@ terminate(_Reason, _State) ->
 %% processing the previous batch.
 %% Only process newest request for each stream (with the newest
 %% retention config), as the config could have changed.
-process_op({cast, {eval, _Pid, Name, _Dir, _Specs, _Fun} = Eval}, {StateAcc, Seen}) ->
-    case sets:is_element(Name, Seen) of
+%% A partial request must not shadow a configured one in the same batch.
+process_op({cast, {eval, _Pid, Name, _Dir, Specs, _Fun} = Eval}, {StateAcc, Seen}) ->
+    Key = {Name, is_partial(Specs)},
+    case sets:is_element(Key, Seen) of
         true ->
             %% Retention for this stream already evaluated
             {StateAcc, Seen};
         false ->
-            {evaluate_retention(Eval, StateAcc), sets:add_element(Name, Seen)}
+            {evaluate_retention(Eval, StateAcc), sets:add_element(Key, Seen)}
     end;
 process_op({call, From, _}, {StateAcc, Seen}) ->
     gen:reply(From, ok),
@@ -96,9 +98,18 @@ evaluate_retention({eval, Pid, Name, Dir, Specs, Fun} = Eval, State) ->
             State
     end.
 
-schedule({eval, _Pid, Name, _Dir, Specs, _Fun} = Eval,
-         {_, _, NumSegmentRemaining},
-         #state{scheduled = Scheduled0} = State) ->
+schedule({eval, _Pid, _Name, _Dir, Specs, _Fun} = Eval, Result, State) ->
+    case is_partial(Specs) of
+        true ->
+            %% Leave the scheduled `max_age' evaluation in place.
+            State;
+        false ->
+            schedule_configured(Eval, Result, State)
+    end.
+
+schedule_configured({eval, _Pid, Name, _Dir, Specs, _Fun} = Eval,
+                    {_, _, NumSegmentRemaining},
+                    #state{scheduled = Scheduled0} = State) ->
     %% we need to check the scheduled map even if the current specs do not
     %% include max_age as the retention config could have changed
     Scheduled = case maps:take(Name, Scheduled0) of
@@ -118,3 +129,12 @@ schedule({eval, _Pid, Name, _Dir, Specs, _Fun} = Eval,
         false ->
             State#state{scheduled = Scheduled}
     end.
+
+%% Only `{'fun', _}' specs, as used by tiered storage: not the stream's
+%% configured retention.
+is_partial([]) ->
+    false;
+is_partial(Specs) ->
+    lists:all(fun ({'fun', _}) -> true;
+                  (_) -> false
+              end, Specs).
