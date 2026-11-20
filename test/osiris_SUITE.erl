@@ -66,6 +66,7 @@ all_tests() ->
      retention_max_age_eventually,
      retention_max_age_update_retention,
      retention_max_age_noproc,
+     retention_max_age_partial_eval,
      retention_add_replica_after,
      retention_overtakes_offset_reader,
      update_retention,
@@ -1485,6 +1486,36 @@ retention_max_age_noproc(Config) ->
     osiris:stop_cluster(Conf1),
     timer:sleep(6000),
     ?assertNot(length(wildcard(Wc)) == 1),
+    ok.
+
+retention_max_age_partial_eval(Config) ->
+    %% a fun-only evaluation must not cancel the scheduled max_age one
+    DataDir = ?config(data_dir, Config),
+    Num = 150000,
+    Name = ?config(cluster_name, Config),
+    SegSize = 50000 * 1000,
+    application:set_env(osiris, retention_eval_interval, 5000),
+    Conf0 =
+        #{name => Name,
+          epoch => 1,
+          leader_node => node(),
+          retention => [{max_age, 5000}],
+          max_segment_size_bytes => SegSize,
+          replica_nodes => []},
+    {ok, #{leader_pid := Leader, replica_pids := []} = Conf1} =
+        osiris:start_cluster(Conf0),
+    timer:sleep(100),
+    write_n(Leader, Num, 0, 1000 * 8, #{}),
+    Dir = filename:join([DataDir, ?FUNCTION_NAME]),
+    Wc = filename:join([Dir, "*.segment"]),
+    ?assert(length(wildcard(Wc)) > 1),
+    KeepAll = fun (IdxFiles) -> {[], IdxFiles} end,
+    ok = osiris_retention:eval(Name, Dir, [{'fun', KeepAll}],
+                               fun (_) -> ok end),
+    await_condition(fun () ->
+                            length(wildcard(Wc)) == 1
+                    end, 1000, 20),
+    osiris:stop_cluster(Conf1),
     ok.
 
 retention_add_replica_after(Config) ->
